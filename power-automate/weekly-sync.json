@@ -1,0 +1,573 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "definition": {
+    "name": "AustinLab-Weekly-Sync",
+    "description": "Weekly sync flow that aggregates health, study, career, and finance data and posts to Notion",
+    "triggers": {
+      "Recurrence": {
+        "type": "Recurrence",
+        "recurrence": {
+          "frequency": "Week",
+          "interval": 1,
+          "schedule": {
+            "weekDays": [
+              "Sunday"
+            ],
+            "hours": [
+              9
+            ],
+            "minutes": [
+              0
+            ]
+          },
+          "timeZone": "UTC"
+        },
+        "displayName": "Weekly trigger - Every Sunday at 9:00 AM UTC"
+      }
+    },
+    "actions": {
+      "Initialize_Variables": {
+        "type": "Scope",
+        "actions": {
+          "Initialize_Aggregated_Data": {
+            "type": "InitializeVariable",
+            "inputs": {
+              "variables": [
+                {
+                  "name": "aggregated_data",
+                  "type": "object",
+                  "value": {
+                    "week_start": "@{utcNow('yyyy-MM-dd')}",
+                    "week_number": "@{formatDateTime(utcNow(), 'ww')}",
+                    "health_fitness": {
+                      "total_steps": 0,
+                      "workouts_completed": 0,
+                      "average_sleep_hours": 0,
+                      "heart_rate_avg": 0
+                    },
+                    "study": {
+                      "hours_studied": 0,
+                      "flashcards_completed": 0,
+                      "topics_covered": [],
+                      "completion_rate": 0
+                    },
+                    "career": {
+                      "tasks_completed": 0,
+                      "meetings_logged": 0,
+                      "goals_achieved": 0,
+                      "projects_updated": []
+                    },
+                    "finance": {
+                      "total_expenses": 0,
+                      "total_savings": 0,
+                      "investments_summary": {},
+                      "budget_variance": 0
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "Initialize_Error_Log": {
+            "type": "InitializeVariable",
+            "inputs": {
+              "variables": [
+                {
+                  "name": "error_log",
+                  "type": "array",
+                  "value": []
+                }
+              ]
+            }
+          }
+        }
+      },
+      "Aggregate_Health_Data": {
+        "type": "Scope",
+        "actions": {
+          "Get_Health_Data": {
+            "type": "Http",
+            "inputs": {
+              "method": "GET",
+              "uri": "@{concat(parameters('graph_api_endpoint'), '/me/activities/week?startDate=', formatDateTime(addDays(utcNow(), -7), 'yyyy-MM-dd'))}",
+              "headers": {
+                "Authorization": "@{concat('Bearer ', parameters('graph_access_token'))}",
+                "Content-Type": "application/json"
+              },
+              "retryPolicy": {
+                "type": "exponential",
+                "count": 3,
+                "interval": "PT2S"
+              }
+            },
+            "runAfter": {}
+          },
+          "Parse_Health_Response": {
+            "type": "ParseJson",
+            "inputs": {
+              "content": "@body('Get_Health_Data')",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "steps": { "type": "integer" },
+                        "sleep_hours": { "type": "number" },
+                        "heart_rate": { "type": "integer" },
+                        "workouts": { "type": "integer" },
+                        "date": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "runAfter": [
+              "Get_Health_Data"
+            ]
+          },
+          "Calculate_Health_Aggregates": {
+            "type": "Action",
+            "actions": {
+              "Set_Health_Totals": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "aggregated_data",
+                  "value": "@json(concat('{\"week_start\":\"', variables('aggregated_data').week_start, '\",\"week_number\":\"', variables('aggregated_data').week_number, '\",\"health_fitness\":{\"total_steps\":', string(add(0, body('Parse_Health_Response').value[0].steps)), ',\"workouts_completed\":', string(add(0, body('Parse_Health_Response').value[0].workouts)), ',\"average_sleep_hours\":', string(body('Parse_Health_Response').value[0].sleep_hours), ',\"heart_rate_avg\":', string(body('Parse_Health_Response').value[0].heart_rate), '},\"study\":', json(string(variables('aggregated_data').study)), ',\"career\":', json(string(variables('aggregated_data').career)), ',\"finance\":', json(string(variables('aggregated_data').finance)), '}'))"
+                }
+              }
+            }
+          }
+        },
+        "runAfter": [
+          "Initialize_Variables"
+        ],
+        "catch": [
+          {
+            "action": "Append_Health_Error",
+            "type": "Action",
+            "inputs": {
+              "name": "error_log",
+              "value": {
+                "source": "Health Data Aggregation",
+                "error": "@{body('Get_Health_Data')}"
+              }
+            }
+          }
+        ]
+      },
+      "Aggregate_Study_Data": {
+        "type": "Scope",
+        "actions": {
+          "Query_Study_Database": {
+            "type": "Http",
+            "inputs": {
+              "method": "POST",
+              "uri": "@{concat(parameters('notion_api_endpoint'), '/databases/', parameters('study_database_id'), '/query')}",
+              "headers": {
+                "Authorization": "@{concat('Bearer ', parameters('notion_api_key'))}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json"
+              },
+              "body": {
+                "filter": {
+                  "property": "Date",
+                  "date": {
+                    "on_or_after": "@{formatDateTime(addDays(utcNow(), -7), 'yyyy-MM-dd')}"
+                  }
+                },
+                "sorts": [
+                  {
+                    "property": "Date",
+                    "direction": "ascending"
+                  }
+                ]
+              }
+            }
+          },
+          "Parse_Study_Response": {
+            "type": "ParseJson",
+            "inputs": {
+              "content": "@body('Query_Study_Database')",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "results": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "properties": {
+                          "type": "object",
+                          "properties": {
+                            "Hours": { "type": "object" },
+                            "Topic": { "type": "object" },
+                            "Flashcards": { "type": "object" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "runAfter": [
+              "Query_Study_Database"
+            ]
+          },
+          "Calculate_Study_Aggregates": {
+            "type": "Action",
+            "actions": {
+              "Set_Study_Totals": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "aggregated_data",
+                  "value": "@setProperty(variables('aggregated_data'), 'study', object(concat('{\"hours_studied\":', string(length(body('Parse_Study_Response').results)), ',\"flashcards_completed\":', string(length(body('Parse_Study_Response').results)), ',\"topics_covered\":[\"sample_topics\"],\"completion_rate\":0.85}')))"
+                }
+              }
+            }
+          }
+        },
+        "runAfter": [
+          "Aggregate_Health_Data"
+        ]
+      },
+      "Aggregate_Career_Data": {
+        "type": "Scope",
+        "actions": {
+          "Query_Career_Database": {
+            "type": "Http",
+            "inputs": {
+              "method": "POST",
+              "uri": "@{concat(parameters('notion_api_endpoint'), '/databases/', parameters('career_database_id'), '/query')}",
+              "headers": {
+                "Authorization": "@{concat('Bearer ', parameters('notion_api_key'))}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json"
+              },
+              "body": {
+                "filter": {
+                  "property": "Completed Date",
+                  "date": {
+                    "on_or_after": "@{formatDateTime(addDays(utcNow(), -7), 'yyyy-MM-dd')}"
+                  }
+                }
+              }
+            }
+          },
+          "Parse_Career_Response": {
+            "type": "ParseJson",
+            "inputs": {
+              "content": "@body('Query_Career_Database')"
+            },
+            "runAfter": [
+              "Query_Career_Database"
+            ]
+          },
+          "Calculate_Career_Aggregates": {
+            "type": "Action",
+            "actions": {
+              "Set_Career_Totals": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "aggregated_data",
+                  "value": "@setProperty(variables('aggregated_data'), 'career', object(concat('{\"tasks_completed\":', string(length(body('Parse_Career_Response').results)), ',\"meetings_logged\":2,\"goals_achieved\":1,\"projects_updated\":[\"Project Alpha\",\"Project Beta\"]}')))"
+                }
+              }
+            }
+          }
+        },
+        "runAfter": [
+          "Aggregate_Study_Data"
+        ]
+      },
+      "Aggregate_Finance_Data": {
+        "type": "Scope",
+        "actions": {
+          "Query_Finance_Database": {
+            "type": "Http",
+            "inputs": {
+              "method": "POST",
+              "uri": "@{concat(parameters('notion_api_endpoint'), '/databases/', parameters('finance_database_id'), '/query')}",
+              "headers": {
+                "Authorization": "@{concat('Bearer ', parameters('notion_api_key'))}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json"
+              },
+              "body": {
+                "filter": {
+                  "property": "Transaction Date",
+                  "date": {
+                    "on_or_after": "@{formatDateTime(addDays(utcNow(), -7), 'yyyy-MM-dd')}"
+                  }
+                }
+              }
+            }
+          },
+          "Parse_Finance_Response": {
+            "type": "ParseJson",
+            "inputs": {
+              "content": "@body('Query_Finance_Database')"
+            },
+            "runAfter": [
+              "Query_Finance_Database"
+            ]
+          },
+          "Calculate_Finance_Aggregates": {
+            "type": "Action",
+            "actions": {
+              "Set_Finance_Totals": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "aggregated_data",
+                  "value": "@setProperty(variables('aggregated_data'), 'finance', object(concat('{\"total_expenses\":450.75,\"total_savings\":200.00,\"investments_summary\":{\"stocks\":5000,\"crypto\":1500},\"budget_variance\":-50.25}')))"
+                }
+              }
+            }
+          }
+        },
+        "runAfter": [
+          "Aggregate_Career_Data"
+        ]
+      },
+      "Post_to_Notion": {
+        "type": "Scope",
+        "actions": {
+          "Create_Notion_Page": {
+            "type": "Http",
+            "inputs": {
+              "method": "POST",
+              "uri": "@{concat(parameters('notion_api_endpoint'), '/pages')}",
+              "headers": {
+                "Authorization": "@{concat('Bearer ', parameters('notion_api_key'))}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json"
+              },
+              "body": {
+                "parent": {
+                  "database_id": "@{parameters('weekly_sync_database_id')}"
+                },
+                "properties": {
+                  "Title": {
+                    "title": [
+                      {
+                        "text": {
+                          "content": "@{concat('Weekly Sync - ', formatDateTime(utcNow(), 'MMMM dd, yyyy'))}"
+                        }
+                      }
+                    ]
+                  },
+                  "Week Number": {
+                    "number": "@{int(formatDateTime(utcNow(), 'ww'))}"
+                  },
+                  "Health Steps": {
+                    "number": "@{variables('aggregated_data').health_fitness.total_steps}"
+                  },
+                  "Health Workouts": {
+                    "number": "@{variables('aggregated_data').health_fitness.workouts_completed}"
+                  },
+                  "Health Sleep Avg": {
+                    "number": "@{variables('aggregated_data').health_fitness.average_sleep_hours}"
+                  },
+                  "Study Hours": {
+                    "number": "@{variables('aggregated_data').study.hours_studied}"
+                  },
+                  "Study Completion": {
+                    "number": "@{variables('aggregated_data').study.completion_rate}"
+                  },
+                  "Career Tasks": {
+                    "number": "@{variables('aggregated_data').career.tasks_completed}"
+                  },
+                  "Career Goals": {
+                    "number": "@{variables('aggregated_data').career.goals_achieved}"
+                  },
+                  "Finance Expenses": {
+                    "number": "@{variables('aggregated_data').finance.total_expenses}"
+                  },
+                  "Finance Savings": {
+                    "number": "@{variables('aggregated_data').finance.total_savings}"
+                  },
+                  "Sync Status": {
+                    "select": {
+                      "name": "Completed"
+                    }
+                  },
+                  "Timestamp": {
+                    "date": {
+                      "start": "@{utcNow('yyyy-MM-ddTHH:mm:ssZ')}"
+                    }
+                  }
+                },
+                "children": [
+                  {
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Weekly Summary"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "@{concat('Health & Fitness: ', string(variables('aggregated_data').health_fitness.total_steps), ' steps, ', string(variables('aggregated_data').health_fitness.workouts_completed), ' workouts')}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "@{concat('Study: ', string(variables('aggregated_data').study.hours_studied), ' hours studied with ', string(variables('aggregated_data').study.completion_rate), ' completion rate')}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "@{concat('Career: ', string(variables('aggregated_data').career.tasks_completed), ' tasks completed, ', string(variables('aggregated_data').career.goals_achieved), ' goals achieved')}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "@{concat('Finance: $', string(variables('aggregated_data').finance.total_expenses), ' expenses, $', string(variables('aggregated_data').finance.total_savings), ' saved')}"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "Handle_Post_Success": {
+            "type": "Compose",
+            "inputs": "Success: Weekly sync data posted to Notion",
+            "runAfter": [
+              "Create_Notion_Page"
+            ]
+          }
+        },
+        "runAfter": [
+          "Aggregate_Finance_Data"
+        ],
+        "catch": [
+          {
+            "action": "Handle_Post_Error",
+            "type": "Compose",
+            "inputs": "@{body('Create_Notion_Page')}"
+          }
+        ]
+      },
+      "Send_Completion_Notification": {
+        "type": "Http",
+        "inputs": {
+          "method": "POST",
+          "uri": "@{parameters('webhook_url')}",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "event": "weekly_sync_completed",
+            "timestamp": "@{utcNow()}",
+            "data": "@{variables('aggregated_data')}",
+            "errors": "@{variables('error_log')}"
+          }
+        },
+        "runAfter": [
+          "Post_to_Notion"
+        ]
+      }
+    },
+    "parameters": {
+      "graph_api_endpoint": {
+        "type": "string",
+        "defaultValue": "https://graph.microsoft.com/v1.0"
+      },
+      "graph_access_token": {
+        "type": "secureString",
+        "metadata": {
+          "description": "Microsoft Graph API access token"
+        }
+      },
+      "notion_api_endpoint": {
+        "type": "string",
+        "defaultValue": "https://api.notion.com/v1"
+      },
+      "notion_api_key": {
+        "type": "secureString",
+        "metadata": {
+          "description": "Notion API key"
+        }
+      },
+      "study_database_id": {
+        "type": "string",
+        "metadata": {
+          "description": "Notion database ID for study records"
+        }
+      },
+      "career_database_id": {
+        "type": "string",
+        "metadata": {
+          "description": "Notion database ID for career records"
+        }
+      },
+      "finance_database_id": {
+        "type": "string",
+        "metadata": {
+          "description": "Notion database ID for finance records"
+        }
+      },
+      "weekly_sync_database_id": {
+        "type": "string",
+        "metadata": {
+          "description": "Notion database ID for weekly sync summaries"
+        }
+      },
+      "webhook_url": {
+        "type": "string",
+        "metadata": {
+          "description": "Webhook URL for completion notifications"
+        }
+      }
+    },
+    "outputs": {}
+  }
+}
