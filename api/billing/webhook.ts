@@ -2,6 +2,8 @@ import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
 import { Pool } from 'pg';
 import { logEvent } from '../analytics/telemetry';
+import { initializeNotionClient, getNotionClient, NotionError } from '../../lib/notionClient';
+import type { DashboardOptions } from '../../lib/notionClient';
 
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
@@ -12,6 +14,15 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
+
+// Initialize Notion client once on module load
+let notionInitialized = false;
+function ensureNotionClient() {
+  if (!notionInitialized && process.env.NOTION_API_KEY) {
+    initializeNotionClient(process.env.NOTION_API_KEY);
+    notionInitialized = true;
+  }
+}
 
 // Type definitions
 interface CheckoutSessionData {
@@ -81,7 +92,29 @@ async function updateSubscriptionStatus(
 }
 
 /**
- * Provision a Notion dashboard for the user
+ * Store dashboard ID in database for user
+ */
+async function storeDashboardId(userId: string, databaseId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    const query = `
+      UPDATE subscriptions
+      SET notion_database_id = $2, updated_at = NOW()
+      WHERE user_id = $1;
+    `;
+
+    await client.query(query, [userId, databaseId]);
+    console.log(`[Billing] Stored Notion dashboard ID ${databaseId} for user ${userId}`);
+  } catch (error) {
+    console.error('[Billing] Error storing dashboard ID:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Provision a Notion dashboard for the user using enhanced wrapper
  */
 async function provisionNotionDashboard(
   userId: string,
@@ -89,66 +122,52 @@ async function provisionNotionDashboard(
   plan: string
 ): Promise<string> {
   try {
-    // Import Notion client dynamically
-    const { Client } = await import('@notionhq/client');
-    const notion = new Client({
-      auth: process.env.NOTION_API_KEY,
-    });
+    ensureNotionClient();
+    const notionClient = getNotionClient();
 
-    // Create database for user
-    const database = await notion.databases.create({
-      parent: {
-        type: 'page_id',
-        page_id: process.env.NOTION_ROOT_PAGE_ID || '',
-      },
-      title: [
-        {
-          type: 'text',
-          text: {
-            content: `${email} - AustinLab Cockpit (${plan})`,
-          },
-        },
-      ],
-      properties: {
-        Name: {
-          title: {},
-        },
-        Category: {
-          select: {
-            options: [
-              { name: 'Health & Fitness', color: 'green' },
-              { name: 'Study', color: 'blue' },
-              { name: 'Career', color: 'purple' },
-              { name: 'Finance', color: 'yellow' },
-            ],
-          },
-        },
-        Status: {
-          select: {
-            options: [
-              { name: 'Completed', color: 'green' },
-              { name: 'In Progress', color: 'yellow' },
-              { name: 'Not Started', color: 'gray' },
-            ],
-          },
-        },
-        'Last Updated': {
-          last_edited_time: {},
-        },
-      },
-    });
+    console.log(`[Billing] Provisioning Notion dashboard for ${email} with plan: ${plan}`);
+
+    const dashboardOptions: DashboardOptions = {
+      title: `${email} - AustinLab Cockpit (${plan})`,
+      parentPageId: process.env.NOTION_ROOT_PAGE_ID || '',
+      categories: ['Health & Fitness', 'Study', 'Career', 'Finance'],
+      icon: '📊',
+      description: 'Personal cockpit for unified tracking across all life domains',
+    };
+
+    // Create dashboard using enhanced wrapper
+    const databaseId = await notionClient.createDashboard(dashboardOptions);
+
+    console.log(`[Billing] ✅ Notion dashboard provisioned successfully`);
+    console.log(`   - Database ID: ${databaseId}`);
+    console.log(`   - Email: ${email}`);
+    console.log(`   - Plan: ${plan}`);
+
+    // Store dashboard ID in database
+    await storeDashboardId(userId, databaseId);
 
     // Log event to telemetry
     await logEvent(userId, 'notion_dashboard_provisioned', {
-      databaseId: database.id,
+      databaseId,
       plan,
       email,
+      timestamp: new Date().toISOString(),
     });
 
-    console.log(`[Billing] Notion dashboard provisioned for ${email}:`, database.id);
-    return database.id;
+    return databaseId;
   } catch (error) {
-    console.error(`[Billing] Error provisioning Notion dashboard for ${email}:`, error);
+    const message = error instanceof Error ? error.message : String(error);
+
+    console.error(`[Billing] ❌ Error provisioning Notion dashboard for ${email}:`, message);
+
+    // Log error event
+    await logEvent(userId, 'notion_dashboard_provisioning_failed', {
+      error: message,
+      email,
+      plan,
+      isRetryable: error instanceof NotionError ? error.retryable : false,
+    });
+
     throw error;
   }
 }
@@ -181,6 +200,8 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session):
   const customerId = typeof customer === 'string' ? customer : customer.id;
 
   try {
+    console.log(`[Billing] Processing checkout for user: ${userId}`);
+
     // Get subscription details from Stripe
     const subscriptions = await stripe.subscriptions.list({
       customer: customerId,
@@ -203,27 +224,90 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session):
       subscription.status
     );
 
-    console.log('[Billing] Subscription status updated:', subscriptionRecord);
+    console.log('[Billing] ✅ Subscription status updated in database');
 
     // Get user email from Stripe customer
     const stripeCustomer = await stripe.customers.retrieve(customerId);
     const userEmail =
       typeof stripeCustomer === 'object' && stripeCustomer.email ? stripeCustomer.email : 'unknown';
 
-    // Provision Notion dashboard
-    await provisionNotionDashboard(userId, userEmail, planName);
+    // Provision Notion dashboard with enhanced wrapper
+    const dashboardId = await provisionNotionDashboard(userId, userEmail, planName);
 
-    // Log event
+    // Log subscription activation event
     await logEvent(userId, 'subscription_activated', {
       plan: planName,
       stripeCustomerId: customerId,
       stripeSubscriptionId: subscription.id,
+      notionDatabaseId: dashboardId,
+      timestamp: new Date().toISOString(),
     });
 
-    console.log(`[Billing] Checkout session completed for user ${userId}`);
+    console.log(`[Billing] ✅ Checkout session completed for user ${userId}`);
+    console.log(`   - Plan: ${planName}`);
+    console.log(`   - Dashboard ID: ${dashboardId}`);
+    console.log(`   - Email: ${userEmail}`);
   } catch (error) {
-    console.error('[Billing] Error handling checkout session:', error);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[Billing] ❌ Error handling checkout session:', message);
+
+    // Log error event
+    await logEvent(userId, 'checkout_session_failed', {
+      error: message,
+      customerId,
+      isRetryable: error instanceof NotionError ? error.retryable : false,
+    });
+
     throw error;
+  }
+}
+
+/**
+ * Handle subscription update events
+ */
+async function handleSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {
+  try {
+    console.log(`[Billing] Processing subscription update: ${subscription.id}`);
+
+    // Extract user ID from subscription metadata or customer
+    const customerId = typeof subscription.customer === 'string' 
+      ? subscription.customer 
+      : subscription.customer?.id;
+
+    if (!customerId) {
+      console.error('[Billing] Missing customer ID in subscription update');
+      return;
+    }
+
+    // You can add logic here to update subscription status if needed
+    console.log(`[Billing] Subscription updated: ${subscription.id} - Status: ${subscription.status}`);
+  } catch (error) {
+    console.error('[Billing] Error handling subscription update:', error);
+  }
+}
+
+/**
+ * Handle subscription deletion/cancellation
+ */
+async function handleSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {
+  try {
+    console.log(`[Billing] Processing subscription deletion: ${subscription.id}`);
+
+    // Extract user ID from subscription metadata or customer
+    const customerId = typeof subscription.customer === 'string'
+      ? subscription.customer
+      : subscription.customer?.id;
+
+    if (!customerId) {
+      console.error('[Billing] Missing customer ID in subscription deletion');
+      return;
+    }
+
+    console.log(`[Billing] Subscription cancelled: ${subscription.id}`);
+
+    // Add cancellation logic here (e.g., disable access, send notification, etc.)
+  } catch (error) {
+    console.error('[Billing] Error handling subscription deletion:', error);
   }
 }
 
@@ -255,16 +339,14 @@ router.post('/', express.raw({ type: 'application/json' }), async (req: Request,
       case 'customer.subscription.updated':
         {
           const subscription = event.data.object as Stripe.Subscription;
-          console.log(`[Billing] Subscription updated: ${subscription.id}`);
-          // Add additional logic for subscription updates if needed
+          await handleSubscriptionUpdated(subscription);
         }
         break;
 
       case 'customer.subscription.deleted':
         {
           const subscription = event.data.object as Stripe.Subscription;
-          console.log(`[Billing] Subscription deleted: ${subscription.id}`);
-          // Add cancellation logic if needed
+          await handleSubscriptionDeleted(subscription);
         }
         break;
 
@@ -272,6 +354,11 @@ router.post('/', express.raw({ type: 'application/json' }), async (req: Request,
         {
           const invoice = event.data.object as Stripe.Invoice;
           console.log(`[Billing] Invoice payment succeeded: ${invoice.id}`);
+          await logEvent('system', 'invoice_payment_succeeded', {
+            invoiceId: invoice.id,
+            customerId: invoice.customer,
+            amount: invoice.amount_paid,
+          });
         }
         break;
 
@@ -279,7 +366,11 @@ router.post('/', express.raw({ type: 'application/json' }), async (req: Request,
         {
           const invoice = event.data.object as Stripe.Invoice;
           console.log(`[Billing] Invoice payment failed: ${invoice.id}`);
-          // Add retry logic or notification if needed
+          await logEvent('system', 'invoice_payment_failed', {
+            invoiceId: invoice.id,
+            customerId: invoice.customer,
+            amount: invoice.amount_due,
+          });
         }
         break;
 
@@ -298,6 +389,7 @@ router.post('/', express.raw({ type: 'application/json' }), async (req: Request,
         await logEvent('system', 'webhook_error', {
           error: error.message,
           type: 'stripe_webhook',
+          stack: error.stack,
         });
       } catch (logError) {
         console.error('[Billing] Error logging webhook error:', logError);
