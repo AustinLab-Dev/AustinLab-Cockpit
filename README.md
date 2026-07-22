@@ -18,3 +18,8 @@ The AustinLab Cockpit is a Systems Upgrade Control Centre designed to integrate 
 - [ ] Implement Power Automate flows
 - [ ] Connect outputs to Notion dashboards
 - [ ] Expand to financial tracking and algorithmic trading
+
+## Getting Started
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/AustinLab-Dev/AustinLab-Cockpit.git
