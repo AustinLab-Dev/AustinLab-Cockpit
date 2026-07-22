@@ -1,0 +1,961 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Power Automate Flow Definition - Weekly Data Aggregation & Notion Sync",
+    "author": "AustinLab-Dev",
+    "date": "2026-07-22",
+    "purpose": "Aggregates health, study, career, and finance data every Sunday and posts to Notion API"
+  },
+  "parameters": {},
+  "variables": {
+    "flowName": "Weekly Data Aggregation - Notion Sync",
+    "flowDescription": "Triggers every Sunday at 6 AM UTC. Aggregates data from health, study, career, and finance sources. Posts results to Notion dashboard."
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-06-01",
+      "name": "weeklyDataAggregationNotionSync",
+      "location": "[resourceGroup().location]",
+      "tags": {
+        "environment": "production",
+        "category": "automation",
+        "source": "AustinLab-Cockpit"
+      },
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "NotionApiKey": {
+              "type": "securestring",
+              "metadata": {
+                "description": "Notion API Key (secret_...)",
+                "required": true
+              }
+            },
+            "NotionDatabaseId": {
+              "type": "string",
+              "metadata": {
+                "description": "Notion Dashboard Database ID",
+                "required": true
+              }
+            },
+            "DataSourceConnections": {
+              "type": "object",
+              "metadata": {
+                "description": "Configuration for data source connections",
+                "health": "Apple HealthKit / Google Fit endpoint",
+                "study": "Learning management system endpoint",
+                "career": "Work/Project management endpoint",
+                "finance": "Financial tracking endpoint"
+              }
+            }
+          },
+          "triggers": {
+            "RecurrenceWeeklySunday": {
+              "type": "Recurrence",
+              "recurrence": {
+                "frequency": "Week",
+                "interval": 1,
+                "schedule": {
+                  "weekDays": ["Sunday"],
+                  "hours": ["06"],
+                  "minutes": [0]
+                },
+                "timeZone": "UTC"
+              }
+            }
+          },
+          "actions": {
+            "InitializeVariables": {
+              "type": "Compose",
+              "inputs": {
+                "aggregationStartTime": "@addDays(utcNow(), -7)",
+                "aggregationEndTime": "@utcNow()",
+                "timestamp": "@utcNow()",
+                "correlationId": "@guid()",
+                "retryAttempts": 0,
+                "maxRetries": 3,
+                "backoffMultiplier": 2
+              },
+              "runAfter": {}
+            },
+            "LogFlowStart": {
+              "type": "Compose",
+              "inputs": {
+                "message": "Weekly Data Aggregation Flow Started",
+                "timestamp": "@utcNow()",
+                "correlationId": "@outputs('InitializeVariables').correlationId",
+                "action": "FLOW_START"
+              },
+              "runAfter": {
+                "InitializeVariables": ["Succeeded"]
+              }
+            },
+            "AggregateHealthData": {
+              "type": "Scope",
+              "actions": {
+                "QueryHealthEndpoint": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@parameters('DataSourceConnections').health.endpoint",
+                    "headers": {
+                      "Authorization": "Bearer @{parameters('DataSourceConnections').health.token}",
+                      "Content-Type": "application/json",
+                      "X-Correlation-ID": "@outputs('InitializeVariables').correlationId"
+                    },
+                    "queries": {
+                      "startDate": "@outputs('InitializeVariables').aggregationStartTime",
+                      "endDate": "@outputs('InitializeVariables').aggregationEndTime",
+                      "metrics": "steps,heartRate,sleep,activeMinutes"
+                    },
+                    "retryPolicy": {
+                      "type": "exponential",
+                      "interval": "PT1S",
+                      "count": 3,
+                      "minimumInterval": "PT1S",
+                      "maximumInterval": "PT30S"
+                    },
+                    "timeout": "PT30S"
+                  },
+                  "runAfter": {}
+                },
+                "ParseHealthResponse": {
+                  "type": "ParseJson",
+                  "inputs": {
+                    "content": "@body('QueryHealthEndpoint')",
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "type": "object",
+                          "properties": {
+                            "totalSteps": { "type": "number" },
+                            "averageHeartRate": { "type": "number" },
+                            "totalSleepHours": { "type": "number" },
+                            "activeMinutes": { "type": "number" },
+                            "caloriesBurned": { "type": "number" }
+                          }
+                        },
+                        "success": { "type": "boolean" },
+                        "timestamp": { "type": "string" }
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "QueryHealthEndpoint": ["Succeeded"]
+                  }
+                },
+                "LogHealthDataSuccess": {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Health data aggregated successfully",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "HEALTH_AGGREGATED",
+                    "dataPoints": "@body('ParseHealthResponse').data"
+                  },
+                  "runAfter": {
+                    "ParseHealthResponse": ["Succeeded"]
+                  }
+                }
+              },
+              "runAfter": {
+                "LogFlowStart": ["Succeeded"]
+              },
+              "onFailure": [
+                {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Health data aggregation failed",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "HEALTH_FAILED",
+                    "error": "@body('QueryHealthEndpoint')?['error']",
+                    "statusCode": "@outputs('QueryHealthEndpoint')['statusCode']",
+                    "retryAttempt": "@outputs('InitializeVariables').retryAttempts"
+                  }
+                }
+              ]
+            },
+            "AggregateStudyData": {
+              "type": "Scope",
+              "actions": {
+                "QueryStudyEndpoint": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@parameters('DataSourceConnections').study.endpoint",
+                    "headers": {
+                      "Authorization": "Bearer @{parameters('DataSourceConnections').study.token}",
+                      "Content-Type": "application/json",
+                      "X-Correlation-ID": "@outputs('InitializeVariables').correlationId"
+                    },
+                    "queries": {
+                      "startDate": "@outputs('InitializeVariables').aggregationStartTime",
+                      "endDate": "@outputs('InitializeVariables').aggregationEndTime",
+                      "metrics": "courseProgress,hoursStudied,assignmentsCompleted,avgScore"
+                    },
+                    "retryPolicy": {
+                      "type": "exponential",
+                      "interval": "PT1S",
+                      "count": 3,
+                      "minimumInterval": "PT1S",
+                      "maximumInterval": "PT30S"
+                    },
+                    "timeout": "PT30S"
+                  },
+                  "runAfter": {}
+                },
+                "ParseStudyResponse": {
+                  "type": "ParseJson",
+                  "inputs": {
+                    "content": "@body('QueryStudyEndpoint')",
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "type": "object",
+                          "properties": {
+                            "totalHoursStudied": { "type": "number" },
+                            "assignmentsCompleted": { "type": "integer" },
+                            "coursesInProgress": { "type": "integer" },
+                            "averageScore": { "type": "number" },
+                            "certificationsEarned": { "type": "integer" }
+                          }
+                        },
+                        "success": { "type": "boolean" },
+                        "timestamp": { "type": "string" }
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "QueryStudyEndpoint": ["Succeeded"]
+                  ]
+                },
+                "LogStudyDataSuccess": {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Study data aggregated successfully",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "STUDY_AGGREGATED",
+                    "dataPoints": "@body('ParseStudyResponse').data"
+                  },
+                  "runAfter": {
+                    "ParseStudyResponse": ["Succeeded"]
+                  }
+                }
+              },
+              "runAfter": {
+                "AggregateHealthData": ["Succeeded", "Failed", "TimedOut", "Skipped"]
+              },
+              "onFailure": [
+                {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Study data aggregation failed",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "STUDY_FAILED",
+                    "error": "@body('QueryStudyEndpoint')?['error']",
+                    "statusCode": "@outputs('QueryStudyEndpoint')['statusCode']"
+                  }
+                }
+              ]
+            },
+            "AggregateCareerData": {
+              "type": "Scope",
+              "actions": {
+                "QueryCareerEndpoint": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@parameters('DataSourceConnections').career.endpoint",
+                    "headers": {
+                      "Authorization": "Bearer @{parameters('DataSourceConnections').career.token}",
+                      "Content-Type": "application/json",
+                      "X-Correlation-ID": "@outputs('InitializeVariables').correlationId"
+                    },
+                    "queries": {
+                      "startDate": "@outputs('InitializeVariables').aggregationStartTime",
+                      "endDate": "@outputs('InitializeVariables').aggregationEndTime",
+                      "metrics": "tasksCompleted,projectProgress,meetingsAttended,milestonesReached"
+                    },
+                    "retryPolicy": {
+                      "type": "exponential",
+                      "interval": "PT1S",
+                      "count": 3,
+                      "minimumInterval": "PT1S",
+                      "maximumInterval": "PT30S"
+                    },
+                    "timeout": "PT30S"
+                  },
+                  "runAfter": {}
+                },
+                "ParseCareerResponse": {
+                  "type": "ParseJson",
+                  "inputs": {
+                    "content": "@body('QueryCareerEndpoint')",
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "type": "object",
+                          "properties": {
+                            "tasksCompleted": { "type": "integer" },
+                            "projectsInProgress": { "type": "integer" },
+                            "meetingsAttended": { "type": "integer" },
+                            "milestonesReached": { "type": "integer" },
+                            "productivityScore": { "type": "number" }
+                          }
+                        },
+                        "success": { "type": "boolean" },
+                        "timestamp": { "type": "string" }
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "QueryCareerEndpoint": ["Succeeded"]
+                  }
+                },
+                "LogCareerDataSuccess": {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Career data aggregated successfully",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "CAREER_AGGREGATED",
+                    "dataPoints": "@body('ParseCareerResponse').data"
+                  },
+                  "runAfter": {
+                    "ParseCareerResponse": ["Succeeded"]
+                  }
+                }
+              },
+              "runAfter": {
+                "AggregateStudyData": ["Succeeded", "Failed", "TimedOut", "Skipped"]
+              },
+              "onFailure": [
+                {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Career data aggregation failed",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "CAREER_FAILED",
+                    "error": "@body('QueryCareerEndpoint')?['error']",
+                    "statusCode": "@outputs('QueryCareerEndpoint')['statusCode']"
+                  }
+                }
+              ]
+            },
+            "AggregateFinanceData": {
+              "type": "Scope",
+              "actions": {
+                "QueryFinanceEndpoint": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@parameters('DataSourceConnections').finance.endpoint",
+                    "headers": {
+                      "Authorization": "Bearer @{parameters('DataSourceConnections').finance.token}",
+                      "Content-Type": "application/json",
+                      "X-Correlation-ID": "@outputs('InitializeVariables').correlationId"
+                    },
+                    "queries": {
+                      "startDate": "@outputs('InitializeVariables').aggregationStartTime",
+                      "endDate": "@outputs('InitializeVariables').aggregationEndTime",
+                      "metrics": "income,expenses,savings,investments,netWorth"
+                    },
+                    "retryPolicy": {
+                      "type": "exponential",
+                      "interval": "PT1S",
+                      "count": 3,
+                      "minimumInterval": "PT1S",
+                      "maximumInterval": "PT30S"
+                    },
+                    "timeout": "PT30S"
+                  },
+                  "runAfter": {}
+                },
+                "ParseFinanceResponse": {
+                  "type": "ParseJson",
+                  "inputs": {
+                    "content": "@body('QueryFinanceEndpoint')",
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "type": "object",
+                          "properties": {
+                            "weeklyIncome": { "type": "number" },
+                            "weeklyExpenses": { "type": "number" },
+                            "weeklyNetSavings": { "type": "number" },
+                            "investmentReturns": { "type": "number" },
+                            "currentNetWorth": { "type": "number" }
+                          }
+                        },
+                        "success": { "type": "boolean" },
+                        "timestamp": { "type": "string" }
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "QueryFinanceEndpoint": ["Succeeded"]
+                  }
+                },
+                "LogFinanceDataSuccess": {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Finance data aggregated successfully",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "FINANCE_AGGREGATED",
+                    "dataPoints": "@body('ParseFinanceResponse').data"
+                  },
+                  "runAfter": {
+                    "ParseFinanceResponse": ["Succeeded"]
+                  }
+                }
+              },
+              "runAfter": {
+                "AggregateCareerData": ["Succeeded", "Failed", "TimedOut", "Skipped"]
+              },
+              "onFailure": [
+                {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Finance data aggregation failed",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('InitializeVariables').correlationId",
+                    "action": "FINANCE_FAILED",
+                    "error": "@body('QueryFinanceEndpoint')?['error']",
+                    "statusCode": "@outputs('QueryFinanceEndpoint')['statusCode']"
+                  }
+                }
+              ]
+            },
+            "CompileAggregatedData": {
+              "type": "Compose",
+              "inputs": {
+                "title": "Weekly Summary - @{formatDateTime(utcNow(), 'yyyy-MM-dd')}",
+                "category": "Weekly Summary",
+                "timestamp": "@utcNow()",
+                "weekStartDate": "@outputs('InitializeVariables').aggregationStartTime",
+                "weekEndDate": "@outputs('InitializeVariables').aggregationEndTime",
+                "correlationId": "@outputs('InitializeVariables').correlationId",
+                "data": {
+                  "health": {
+                    "totalSteps": "@body('ParseHealthResponse')?.data?.totalSteps ?? 0",
+                    "averageHeartRate": "@body('ParseHealthResponse')?.data?.averageHeartRate ?? 0",
+                    "totalSleepHours": "@body('ParseHealthResponse')?.data?.totalSleepHours ?? 0",
+                    "activeMinutes": "@body('ParseHealthResponse')?.data?.activeMinutes ?? 0",
+                    "caloriesBurned": "@body('ParseHealthResponse')?.data?.caloriesBurned ?? 0"
+                  },
+                  "study": {
+                    "totalHoursStudied": "@body('ParseStudyResponse')?.data?.totalHoursStudied ?? 0",
+                    "assignmentsCompleted": "@body('ParseStudyResponse')?.data?.assignmentsCompleted ?? 0",
+                    "coursesInProgress": "@body('ParseStudyResponse')?.data?.coursesInProgress ?? 0",
+                    "averageScore": "@body('ParseStudyResponse')?.data?.averageScore ?? 0",
+                    "certificationsEarned": "@body('ParseStudyResponse')?.data?.certificationsEarned ?? 0"
+                  },
+                  "career": {
+                    "tasksCompleted": "@body('ParseCareerResponse')?.data?.tasksCompleted ?? 0",
+                    "projectsInProgress": "@body('ParseCareerResponse')?.data?.projectsInProgress ?? 0",
+                    "meetingsAttended": "@body('ParseCareerResponse')?.data?.meetingsAttended ?? 0",
+                    "milestonesReached": "@body('ParseCareerResponse')?.data?.milestonesReached ?? 0",
+                    "productivityScore": "@body('ParseCareerResponse')?.data?.productivityScore ?? 0"
+                  },
+                  "finance": {
+                    "weeklyIncome": "@body('ParseFinanceResponse')?.data?.weeklyIncome ?? 0",
+                    "weeklyExpenses": "@body('ParseFinanceResponse')?.data?.weeklyExpenses ?? 0",
+                    "weeklyNetSavings": "@body('ParseFinanceResponse')?.data?.weeklyNetSavings ?? 0",
+                    "investmentReturns": "@body('ParseFinanceResponse')?.data?.investmentReturns ?? 0",
+                    "currentNetWorth": "@body('ParseFinanceResponse')?.data?.currentNetWorth ?? 0"
+                  }
+                }
+              },
+              "runAfter": {
+                "AggregateFinanceData": ["Succeeded", "Failed", "TimedOut", "Skipped"]
+              }
+            },
+            "CreateNotionPagePayload": {
+              "type": "Compose",
+              "inputs": {
+                "parent": {
+                  "database_id": "@parameters('NotionDatabaseId')"
+                },
+                "properties": {
+                  "Name": {
+                    "title": [
+                      {
+                        "type": "text",
+                        "text": {
+                          "content": "@outputs('CompileAggregatedData').title"
+                        }
+                      }
+                    ]
+                  },
+                  "Category": {
+                    "select": {
+                      "name": "@outputs('CompileAggregatedData').category"
+                    }
+                  },
+                  "Status": {
+                    "select": {
+                      "name": "In Progress"
+                    }
+                  },
+                  "Week Start": {
+                    "date": {
+                      "start": "@formatDateTime(outputs('CompileAggregatedData').weekStartDate, 'yyyy-MM-dd')"
+                    }
+                  },
+                  "Week End": {
+                    "date": {
+                      "start": "@formatDateTime(outputs('CompileAggregatedData').weekEndDate, 'yyyy-MM-dd')"
+                    }
+                  },
+                  "Correlation ID": {
+                    "rich_text": [
+                      {
+                        "type": "text",
+                        "text": {
+                          "content": "@outputs('CompileAggregatedData').correlationId"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "children": [
+                  {
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "📊 Weekly Summary"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "heading_3",
+                    "heading_3": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "🏃 Health Metrics"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "@{string(outputs('CompileAggregatedData').data.health.totalSteps)} steps taken"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Average heart rate: @{string(outputs('CompileAggregatedData').data.health.averageHeartRate)} bpm"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Total sleep: @{string(outputs('CompileAggregatedData').data.health.totalSleepHours)} hours"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Active minutes: @{string(outputs('CompileAggregatedData').data.health.activeMinutes)}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "heading_3",
+                    "heading_3": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "📚 Study Progress"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Study hours: @{string(outputs('CompileAggregatedData').data.study.totalHoursStudied)}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Assignments completed: @{string(outputs('CompileAggregatedData').data.study.assignmentsCompleted)}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Average score: @{string(outputs('CompileAggregatedData').data.study.averageScore)}%"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "heading_3",
+                    "heading_3": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "💼 Career Achievements"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Tasks completed: @{string(outputs('CompileAggregatedData').data.career.tasksCompleted)}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Milestones reached: @{string(outputs('CompileAggregatedData').data.career.milestonesReached)}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Productivity score: @{string(outputs('CompileAggregatedData').data.career.productivityScore)}/100"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "heading_3",
+                    "heading_3": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "💰 Financial Summary"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Weekly income: $@{string(outputs('CompileAggregatedData').data.finance.weeklyIncome)}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Weekly expenses: $@{string(outputs('CompileAggregatedData').data.finance.weeklyExpenses)}"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                      "rich_text": [
+                        {
+                          "type": "text",
+                          "text": {
+                            "content": "Net savings: $@{string(outputs('CompileAggregatedData').data.finance.weeklyNetSavings)}"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "runAfter": {
+                "CompileAggregatedData": ["Succeeded"]
+              }
+            },
+            "PostToNotionAPI": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "https://api.notion.com/v1/pages",
+                "headers": {
+                  "Authorization": "Bearer @{parameters('NotionApiKey')}",
+                  "Content-Type": "application/json",
+                  "Notion-Version": "2022-06-28",
+                  "X-Correlation-ID": "@outputs('CompileAggregatedData').correlationId"
+                },
+                "body": "@outputs('CreateNotionPagePayload')",
+                "retryPolicy": {
+                  "type": "exponential",
+                  "interval": "PT1S",
+                  "count": 3,
+                  "minimumInterval": "PT1S",
+                  "maximumInterval": "PT30S"
+                },
+                "timeout": "PT60S"
+              },
+              "runAfter": {
+                "CreateNotionPagePayload": ["Succeeded"]
+              }
+            },
+            "LogSuccessfulSync": {
+              "type": "Compose",
+              "inputs": {
+                "message": "Weekly data successfully synced to Notion",
+                "timestamp": "@utcNow()",
+                "correlationId": "@outputs('CompileAggregatedData').correlationId",
+                "action": "SYNC_SUCCESS",
+                "notionPageId": "@body('PostToNotionAPI')?.id",
+                "dataPoints": {
+                  "healthMetrics": "@outputs('CompileAggregatedData').data.health",
+                  "studyMetrics": "@outputs('CompileAggregatedData').data.study",
+                  "careerMetrics": "@outputs('CompileAggregatedData').data.career",
+                  "financeMetrics": "@outputs('CompileAggregatedData').data.finance"
+                }
+              },
+              "runAfter": {
+                "PostToNotionAPI": ["Succeeded"]
+              ]
+            },
+            "ErrorHandler": {
+              "type": "Scope",
+              "actions": {
+                "ComposeErrorLog": {
+                  "type": "Compose",
+                  "inputs": {
+                    "message": "Critical error in weekly aggregation flow",
+                    "timestamp": "@utcNow()",
+                    "correlationId": "@outputs('CompileAggregatedData').correlationId",
+                    "action": "ERROR_OCCURRED",
+                    "errorDetails": {
+                      "healthDataError": "@if(equals(result('AggregateHealthData'), 'Failed'), body('QueryHealthEndpoint')?['error'], null)",
+                      "studyDataError": "@if(equals(result('AggregateStudyData'), 'Failed'), body('QueryStudyEndpoint')?['error'], null)",
+                      "careerDataError": "@if(equals(result('AggregateCareerData'), 'Failed'), body('QueryCareerEndpoint')?['error'], null)",
+                      "financeDataError": "@if(equals(result('AggregateFinanceData'), 'Failed'), body('QueryFinanceEndpoint')?['error'], null)",
+                      "notionSyncError": "@if(equals(result('PostToNotionAPI'), 'Failed'), body('PostToNotionAPI')?['error'], null)"
+                    },
+                    "retryable": "@if(or(equals(outputs('PostToNotionAPI')?.statusCode, 429), equals(outputs('PostToNotionAPI')?.statusCode, 500), equals(outputs('PostToNotionAPI')?.statusCode, 502), equals(outputs('PostToNotionAPI')?.statusCode, 503), equals(outputs('PostToNotionAPI')?.statusCode, 504)), true, false)"
+                  },
+                  "runAfter": {}
+                },
+                "SendErrorNotification": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "https://api.notion.com/v1/pages",
+                    "headers": {
+                      "Authorization": "Bearer @{parameters('NotionApiKey')}",
+                      "Content-Type": "application/json",
+                      "Notion-Version": "2022-06-28",
+                      "X-Correlation-ID": "@outputs('CompileAggregatedData').correlationId"
+                    },
+                    "body": {
+                      "parent": {
+                        "database_id": "@parameters('NotionDatabaseId')"
+                      },
+                      "properties": {
+                        "Name": {
+                          "title": [
+                            {
+                              "type": "text",
+                              "text": {
+                                "content": "❌ Sync Failed - @{formatDateTime(utcNow(), 'yyyy-MM-dd HH:mm')}"
+                              }
+                            }
+                          ]
+                        },
+                        "Category": {
+                          "select": {
+                            "name": "Error Log"
+                          }
+                        },
+                        "Status": {
+                          "select": {
+                            "name": "Failed"
+                          }
+                        },
+                        "Correlation ID": {
+                          "rich_text": [
+                            {
+                              "type": "text",
+                              "text": {
+                                "content": "@outputs('CompileAggregatedData').correlationId"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      "children": [
+                        {
+                          "object": "block",
+                          "type": "paragraph",
+                          "paragraph": {
+                            "rich_text": [
+                              {
+                                "type": "text",
+                                "text": {
+                                  "content": "@string(outputs('ComposeErrorLog'))"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    "timeout": "PT30S"
+                  },
+                  "runAfter": {
+                    "ComposeErrorLog": ["Succeeded"]
+                  }
+                }
+              },
+              "runAfter": {
+                "PostToNotionAPI": ["Failed", "TimedOut"]
+              }
+            }
+          },
+          "outputs": {
+            "SyncResult": {
+              "type": "object",
+              "value": {
+                "success": "@equals(result('PostToNotionAPI'), 'Succeeded')",
+                "timestamp": "@utcNow()",
+                "correlationId": "@outputs('CompileAggregatedData').correlationId",
+                "notionPageId": "@body('PostToNotionAPI')?.id",
+                "aggregatedData": "@outputs('CompileAggregatedData').data"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "flowId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', 'weeklyDataAggregationNotionSync'), '2019-06-01').id]"
+    },
+    "flowUri": {
+      "type": "string",
+      "value": "[listCallbackUrl(resourceId('Microsoft.Logic/workflows/triggers', 'weeklyDataAggregationNotionSync', 'RecurrenceWeeklySunday'), '2019-06-01').value]"
+    }
+  }
+}
